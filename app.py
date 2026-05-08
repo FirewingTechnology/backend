@@ -3,7 +3,7 @@ import razorpay
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth as firebase_auth
 import json
 
 app = Flask(__name__)
@@ -58,6 +58,37 @@ def create_order():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/create-admin', methods=['POST'])
+def create_admin():
+    try:
+        data = request.json
+        email = data.get('email')
+        password = data.get('password')
+        role = data.get('role', 'admin') # 'admin' or 'super_admin'
+        
+        if not email or not password:
+            return jsonify({'error': 'Email and password are required'}), 400
+
+        # Create user in Firebase Auth
+        user_record = firebase_auth.create_user(
+            email=email,
+            password=password
+        )
+
+        # Save role in Firestore (Separate collections)
+        collection_name = 'super_admins' if role == 'super_admin' else 'admins'
+        db.collection(collection_name).document(user_record.uid).set({
+            'email': email,
+            'role': role,
+            'createdAt': firestore.SERVER_TIMESTAMP
+        })
+
+        return jsonify({'status': 'success', 'uid': user_record.uid, 'message': f'Admin {email} created successfully!'}), 201
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/verify-signature', methods=['POST'])
 def verify_signature():
     try:
@@ -80,9 +111,9 @@ def verify_signature():
         # --- Signature is VALID. We can safely update the database ---
         
         if uid and amount_paid:
-            user_ref = db.collection('users').document(uid)
             
             if app_type == 'user':
+                user_ref = db.collection('users').document(uid)
                 @firestore.transactional
                 def update_user_wallet(transaction, user_ref):
                     user_snapshot = user_ref.get(transaction=transaction)
@@ -126,18 +157,38 @@ def verify_signature():
                 transaction = db.transaction()
                 update_user_wallet(transaction, user_ref)
                 
-            else:
-                # Example Firebase update for PRO app:
-                user_ref.update({
+            elif app_type == 'pro':
+                # Update logic for PRO app:
+                pro_ref = db.collection('electricians').document(uid)
+                pro_ref.update({
                     'wallet.platformDueAmount': firestore.Increment(-float(amount_paid))
                 })
                 
-                # Also log the transaction in the user's ledger subcollection
-                user_ref.collection('ledger').add({
+                # Log the transaction in the user's ledger subcollection
+                pro_ref.collection('ledger').add({
                     'amount': float(amount_paid),
                     'type': 'dues_paid',
                     'status': 'completed',
                     'description': 'Platform Dues Paid via Razorpay',
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+                
+            elif app_type == 'org':
+                # Example update logic for ORG app:
+                # Organizations might be stored in an 'organizations' collection instead of 'users'
+                org_ref = db.collection('organizations').document(uid) 
+                
+                # Update their wallet or custom fields as needed
+                org_ref.update({
+                    'wallet.balance': firestore.Increment(float(amount_paid))
+                })
+                
+                # Log the transaction
+                org_ref.collection('ledger').add({
+                    'amount': float(amount_paid),
+                    'type': 'funds_added',
+                    'status': 'completed',
+                    'description': 'Funds added to Org Wallet via Razorpay',
                     'timestamp': firestore.SERVER_TIMESTAMP
                 })
         
