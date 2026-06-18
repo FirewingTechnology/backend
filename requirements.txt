@@ -19,3 +19,6 @@ requests>=2.31.0
 
 # Production WSGI Server
 gunicorn>=22.0.0
+
+# Validation
+marshmallow>=3.20.0
