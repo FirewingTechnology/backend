@@ -10,7 +10,6 @@ from datetime import datetime
 class JobService:
     def __init__(self):
         self.repo = JobRepository()
-        self.lock_service = RedisLockService()
         self.db = firestore.client() # For cross-collection queries
         
         # In production, redis_client would be injected
@@ -18,6 +17,8 @@ class JobService:
         import os
         redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
         redis_client = redis.from_url(redis_url)
+        
+        self.lock_service = RedisLockService(redis_client)
         self.matching_engine = MatchingEngine(redis_client)
 
     def dispatch_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
