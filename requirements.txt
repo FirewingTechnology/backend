@@ -1,5 +1,21 @@
-flask
-flask-cors
-razorpay
-firebase-admin
-gunicorn
+# Core Framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Payment
+razorpay>=1.4.0
+
+# Firebase
+firebase-admin>=6.5.0
+
+# Redis (Distributed Locking)
+redis>=5.0.0
+
+# Security (OTP bcrypt hashing)
+bcrypt>=4.1.0
+
+# HTTP (RazorpayX REST calls)
+requests>=2.31.0
+
+# Production WSGI Server
+gunicorn>=22.0.0
