@@ -1,9 +1,44 @@
 from flask import Blueprint, request, jsonify, current_app
 from src.infrastructure.redis.exceptions import LockAcquisitionError
+from firebase_admin import auth
+from functools import wraps
 
 dispute_api = Blueprint('dispute_api', __name__)
 
+def require_auth(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
+
+def require_admin(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+            if decoded_token.get('role') not in ['admin', 'super_admin']:
+                return jsonify({"error": "Forbidden: Requires Admin Role"}), 403
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
+
 @dispute_api.route('/api/v2/disputes/raise', methods=['POST'])
+@require_auth
 def raise_dispute():
     payload = request.json
     job_id = payload.get('jobId')
@@ -30,6 +65,7 @@ def raise_dispute():
 
 
 @dispute_api.route('/api/v2/disputes/resolve', methods=['POST'])
+@require_admin
 def resolve_dispute():
     """Admin-only endpoint. Must be protected by admin auth middleware in production."""
     payload = request.json

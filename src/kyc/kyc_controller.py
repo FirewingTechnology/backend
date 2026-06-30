@@ -1,8 +1,42 @@
 from flask import Blueprint, request, jsonify, current_app
 from google.cloud import firestore
 from src.infrastructure.redis.exceptions import LockAcquisitionError
+from firebase_admin import auth
+from functools import wraps
 
 kyc_api = Blueprint('kyc_api', __name__)
+
+def require_auth(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
+
+def require_admin(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+            if decoded_token.get('role') not in ['admin', 'super_admin']:
+                return jsonify({"error": "Forbidden: Requires Admin Role"}), 403
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
 
 def _get_db_and_lock() -> tuple:
     db = current_app.config.get('FIRESTORE_DB')
@@ -13,6 +47,7 @@ def _get_db_and_lock() -> tuple:
 
 
 @kyc_api.route('/api/v2/kyc/submit', methods=['POST'])
+@require_auth
 def submit_kyc():
     payload = request.json
     uid = payload.get('uid')
@@ -50,6 +85,7 @@ def _run_submit_tx(tx, kyc_repo, uid, pan_number, selfie_url, bank_proof_url, ad
 
 
 @kyc_api.route('/api/v2/kyc/admin/approve', methods=['POST'])
+@require_admin
 def admin_update_kyc():
     """Admin-only. Must be protected by admin auth middleware in production."""
     payload = request.json

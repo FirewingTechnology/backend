@@ -276,9 +276,11 @@ def verify_signature():
                 # Update logic for PRO app:
                 # Professionals are stored in the 'users' collection with role 'electrician'
                 pro_ref = db.collection('users').document(uid)
-                pro_ref.update({
-                    'wallet.platformDueAmount': firestore.Increment(-amount_paid_paise)
-                })
+                pro_ref.set({
+                    'wallet': {
+                        'platformDueAmount': firestore.Increment(-amount_paid_paise)
+                    }
+                }, merge=True)
                 
                 # Log the transaction in the user's ledger subcollection
                 # Matching the structure expected by the Pro App

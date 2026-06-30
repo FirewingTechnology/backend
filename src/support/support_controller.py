@@ -1,10 +1,44 @@
 from flask import Blueprint, request, jsonify
-from firebase_admin import firestore
+from firebase_admin import firestore, auth
+from functools import wraps
+
+def require_auth(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
+
+def require_admin(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth_header.split('Bearer ')[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+            if decoded_token.get('role') not in ['admin', 'super_admin']:
+                return jsonify({"error": "Forbidden: Requires Admin Role"}), 403
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return wrapped
 
 support_api = Blueprint('support_controller', __name__)
 db = firestore.client()
 
 @support_api.route('/api/v2/support/tickets', methods=['POST'])
+@require_auth
 def create_ticket():
     data = request.json
     uid = data.get('uid')
@@ -42,6 +76,7 @@ def create_ticket():
     return jsonify({'status': 'created', 'ticketId': doc_ref.id}), 201
 
 @support_api.route('/api/v2/support/tickets/<ticket_id>/escalate', methods=['PUT'])
+@require_admin
 def escalate_ticket(ticket_id):
     """ Escalate to Level 2 Support (Finance / Trust & Safety) """
     ref = db.collection('support_tickets').document(ticket_id)
