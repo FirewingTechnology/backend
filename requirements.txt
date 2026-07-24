@@ -22,3 +22,4 @@ gunicorn>=22.0.0
 
 # Validation
 marshmallow>=3.20.0
+twilio==9.3.2

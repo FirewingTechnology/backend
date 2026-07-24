@@ -1,10 +1,14 @@
 import os
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import razorpay
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
-import json
 
 app = Flask(__name__)
 CORS(app)
@@ -59,6 +63,16 @@ from src.disputes.dispute_controller import dispute_api
 from src.kyc.kyc_repository import KycRepository
 from src.kyc.kyc_controller import kyc_api
 
+# Sprint 5 Imports (Chat)
+from src.chat.chat_service import ChatService
+from src.chat.chat_controller import chat_api, init_chat_api
+
+# Auth Imports
+from src.auth.auth_controller import auth_api
+
+# Voice Imports
+from src.voice.voice_controller import voice_api
+
 redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 try:
     redis_client = redis.from_url(redis_url)
@@ -95,6 +109,10 @@ try:
     # Sprint 4: KYC
     kyc_repo = KycRepository(db)
 
+    # Sprint 5: Chat
+    chat_service = ChatService(db, redis_client)
+    init_chat_api(chat_service)
+
     # Register all config
     app.config['FIRESTORE_DB'] = db
     app.config['LOCK_SERVICE'] = lock_service
@@ -107,6 +125,8 @@ try:
     app.config['OTP_SERVICE'] = otp_service
     app.config['DISPUTE_SERVICE'] = dispute_service
     app.config['KYC_REPO'] = kyc_repo
+    app.config['REDIS_CLIENT'] = redis_client
+    app.config['CHAT_SERVICE'] = chat_service
 
     # Register all blueprints
     app.register_blueprint(payment_api)
@@ -117,6 +137,9 @@ try:
     app.register_blueprint(job_api)
     app.register_blueprint(dispute_api)
     app.register_blueprint(kyc_api)
+    app.register_blueprint(chat_api, url_prefix='/api/chat')
+    app.register_blueprint(auth_api, url_prefix='/api/auth')
+    app.register_blueprint(voice_api, url_prefix='/api')
 
 except Exception as e:
     print(f"Failed to initialize V2 Finance modules: {e}")
@@ -146,8 +169,11 @@ def home():
 @require_auth
 def create_order():
     try:
-        data = request.json
+        data = request.json or {}
         amount_paise = data.get('amountPaise') # amount in paise
+        if amount_paise is None and data.get('amount') is not None:
+            amount_paise = int(float(data.get('amount')) * 100)
+
         uid = request.user.get('uid')
         
         if not amount_paise:
@@ -206,11 +232,11 @@ def create_admin():
 @require_auth
 def verify_signature():
     try:
-        data = request.json
+        data = request.json or {}
         razorpay_order_id = data.get('razorpay_order_id')
         razorpay_payment_id = data.get('razorpay_payment_id')
         razorpay_signature = data.get('razorpay_signature')
-        app_type = data.get('app_type', 'pro') # default to 'pro' for backwards compatibility
+        app_type = data.get('app_type', 'user') # default to 'user'
         reason = data.get('reason', 'Payment via Razorpay')
         uid = request.user.get('uid')
         
@@ -223,69 +249,85 @@ def verify_signature():
         
         # --- Signature is VALID. We can safely update the database ---
         payment = client.payment.fetch(razorpay_payment_id)
-        amount_paid_paise = int(payment["amount"])
+        amount_paid_paise = int(payment.get("amount", 0))
+        amount_paid_rupees = float(amount_paid_paise) / 100.0
         
-        if uid and amount_paid_paise:
+        if uid and amount_paid_paise > 0:
             
             if app_type == 'user':
+                wallet_ref = db.collection('wallets').document(uid)
                 user_ref = db.collection('users').document(uid)
+                ledger_ref = db.collection('wallet_ledger').document(razorpay_payment_id)
+                tx_ref = db.collection('transactions').document()
+
                 @firestore.transactional
-                def update_user_wallet(transaction, user_ref):
-                    user_snapshot = user_ref.get(transaction=transaction)
-                    if not user_snapshot.exists:
-                        return False
+                def update_user_wallet(transaction):
+                    # Check Idempotency (prevent duplicate credit if already processed)
+                    ledger_snap = ledger_ref.get(transaction=transaction)
+                    if ledger_snap.exists:
+                        return True
+
+                    wallet_snap = wallet_ref.get(transaction=transaction)
+                    wallet_data = wallet_snap.to_dict() if wallet_snap.exists else {}
+                    current_balance = float(wallet_data.get('balance', 0.0))
+                    new_balance = current_balance + amount_paid_rupees
                     
-                    user_data = user_snapshot.to_dict()
-                    current_wallet = user_data.get('wallet', {'balance': 0, 'totalSpent': 0})
-                    current_balance = int(current_wallet.get('balance', 0))
+                    # Update top-level wallets collection
+                    transaction.set(wallet_ref, {
+                        'balance': new_balance,
+                        'updatedAt': firestore.SERVER_TIMESTAMP
+                    }, merge=True)
                     
-                    new_balance = current_balance + amount_paid_paise
-                    current_wallet['balance'] = new_balance
-                    
-                    # Update the user doc
-                    transaction.update(user_ref, {'wallet': current_wallet})
-                    
-                    # Add to wallet_ledger
-                    ledger_ref = db.collection('wallet_ledger').document()
+                    # Update users collection embedded wallet balance if user doc exists
+                    user_snap = user_ref.get(transaction=transaction)
+                    if user_snap.exists:
+                        user_data = user_snap.to_dict() or {}
+                        current_wallet = user_data.get('wallet', {})
+                        current_wallet['balance'] = new_balance
+                        transaction.update(user_ref, {'wallet': current_wallet})
+
+                    # Record in wallet_ledger
                     transaction.set(ledger_ref, {
                         'userId': uid,
                         'type': 'credit',
-                        'amount': amount_paid_paise,
+                        'amount': amount_paid_rupees,
                         'reason': reason,
                         'referenceId': razorpay_payment_id,
                         'previousBalance': current_balance,
                         'newBalance': new_balance,
                         'timestamp': firestore.SERVER_TIMESTAMP
                     })
-                    
-                    # Also add a transaction for UI history compatibility if needed
-                    tx_ref = user_ref.collection('transactions').document()
+
+                    # Record in top-level transactions collection (for WalletScreen UI stream)
                     transaction.set(tx_ref, {
+                        'userId': uid,
                         'type': 'credit',
                         'title': reason,
-                        'amount': amount_paid_paise,
-                        'createdAt': firestore.SERVER_TIMESTAMP
+                        'amount': amount_paid_rupees,
+                        'createdAt': firestore.SERVER_TIMESTAMP,
+                        'referenceId': razorpay_payment_id
                     })
                     return True
                 
                 # Execute transaction
                 transaction = db.transaction()
-                update_user_wallet(transaction, user_ref)
+                update_user_wallet(transaction)
                 
             elif app_type == 'pro':
-                # Update logic for PRO app:
-                # Professionals are stored in the 'users' collection with role 'electrician'
                 pro_ref = db.collection('users').document(uid)
+                pro_wallet_ref = db.collection('wallets').document(uid)
+                
                 pro_ref.set({
                     'wallet': {
-                        'platformDueAmount': firestore.Increment(-amount_paid_paise)
+                        'platformDueAmount': firestore.Increment(-amount_paid_rupees)
                     }
                 }, merge=True)
+                pro_wallet_ref.set({
+                    'platformDueAmount': firestore.Increment(-amount_paid_rupees)
+                }, merge=True)
                 
-                # Log the transaction in the user's ledger subcollection
-                # Matching the structure expected by the Pro App
                 pro_ref.collection('ledger').add({
-                    'amount': amount_paid_paise,
+                    'amount': amount_paid_rupees,
                     'type': 'dues_paid',
                     'status': 'completed',
                     'description': 'Platform Dues Paid via Razorpay',
@@ -294,18 +336,14 @@ def verify_signature():
                 })
                 
             elif app_type == 'org':
-                # Example update logic for ORG app:
-                # Organizations might be stored in an 'organizations' collection instead of 'users'
                 org_ref = db.collection('organizations').document(uid) 
                 
-                # Update their wallet or custom fields as needed
                 org_ref.update({
-                    'wallet.balance': firestore.Increment(amount_paid_paise)
+                    'wallet.balance': firestore.Increment(amount_paid_rupees)
                 })
                 
-                # Log the transaction
                 org_ref.collection('ledger').add({
-                    'amount': amount_paid_paise,
+                    'amount': amount_paid_rupees,
                     'type': 'funds_added',
                     'status': 'completed',
                     'description': 'Funds added to Org Wallet via Razorpay',
@@ -322,6 +360,27 @@ def verify_signature():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+
+@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
+def health_check():
+    health_status = {
+        'status': 'healthy',
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'services': {
+            'firestore': 'ok',
+            'redis': 'ok'
+        }
+    }
+    try:
+        if redis_client:
+            redis_client.ping()
+    except Exception:
+        health_status['services']['redis'] = 'degraded'
+        health_status['status'] = 'degraded'
+        
+    return jsonify(health_status), 200 if health_status['status'] == 'healthy' else 503
 
 
 if __name__ == '__main__':
