@@ -1,8 +1,10 @@
 import os
 import json
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import razorpay
 from flask import Flask, request, jsonify
