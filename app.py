@@ -364,6 +364,105 @@ def verify_signature():
 
 
 
+@app.route('/withdraw', methods=['POST'])
+@require_auth
+def process_withdrawal():
+    try:
+        data = request.json or {}
+        uid = request.user.get('uid')
+        amount = float(data.get('amount', 0.0))
+        bank_details = data.get('bank_details', {})
+
+        if not uid or amount <= 0:
+            return jsonify({'error': 'Valid user ID and amount are required'}), 400
+
+        wallet_ref = db.collection('wallets').document(uid)
+        user_ref = db.collection('users').document(uid)
+        payout_ref = db.collection('payout_requests').document()
+        ledger_ref = user_ref.collection('ledger').document()
+
+        @firestore.transactional
+        def run_withdrawal_tx(transaction):
+            wallet_snap = wallet_ref.get(transaction=transaction)
+            if not wallet_snap.exists:
+                raise Exception('Wallet document not found')
+            
+            wallet_data = wallet_snap.to_dict() or {}
+            balance = float(wallet_data.get('balance', 0.0))
+            platform_due = float(wallet_data.get('platformDueAmount', 0.0))
+
+            if balance < amount:
+                raise Exception(f'Insufficient wallet balance. Available: ₹{int(balance)}')
+
+            if platform_due > 100:
+                raise Exception(f'Please clear platform dues (₹{int(platform_due)}) before requesting withdrawal')
+
+            new_balance = balance - amount
+            
+            # Deduct from wallets collection
+            transaction.set(wallet_ref, {
+                'balance': new_balance,
+                'pendingPayouts': firestore.Increment(amount),
+                'lastUpdated': firestore.SERVER_TIMESTAMP
+            }, merge=True)
+
+            # Update embedded wallet balance if user doc exists
+            user_snap = user_ref.get(transaction=transaction)
+            if user_snap.exists:
+                user_data = user_snap.to_dict() or {}
+                current_wallet = user_data.get('wallet', {})
+                current_wallet['balance'] = new_balance
+                transaction.update(user_ref, {'wallet': current_wallet})
+
+            # Create payout request
+            transaction.set(payout_ref, {
+                'id': payout_ref.id,
+                'uid': uid,
+                'amount': amount,
+                'status': 'pending',
+                'requestedAt': firestore.SERVER_TIMESTAMP,
+                'bankDetails': bank_details
+            })
+
+            # Record in ledger
+            transaction.set(ledger_ref, {
+                'id': ledger_ref.id,
+                'type': 'payout_request',
+                'amount': -amount,
+                'status': 'pending',
+                'description': 'Payout request initiated',
+                'referenceId': payout_ref.id,
+                'timestamp': firestore.SERVER_TIMESTAMP,
+                'paymentMethod': 'bank_transfer'
+            })
+
+            return payout_ref.id
+
+        transaction = db.transaction()
+        payout_id = run_withdrawal_tx(transaction)
+
+        # Trigger RazorpayX payout if client is initialized
+        payout_status = 'pending'
+        try:
+            if 'payout_client' in globals() and payout_client:
+                amount_paise = int(amount * 100)
+                payout_res = payout_client.create_payout(uid, amount_paise, payout_id)
+                payout_status = payout_res.get('status', 'payout_initiated')
+                payout_ref.update({'payoutId': payout_res.get('id'), 'status': payout_status})
+        except Exception as payout_err:
+            print(f'RazorpayX payout error (fallback to manual processing): {payout_err}')
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Withdrawal initiated successfully',
+            'payoutId': payout_id,
+            'payoutStatus': payout_status
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
 @app.route('/api/health', methods=['GET'])
 @app.route('/health', methods=['GET'])
 def health_check():
