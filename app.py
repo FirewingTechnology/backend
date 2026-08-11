@@ -463,6 +463,53 @@ def process_withdrawal():
         return jsonify({'error': str(e)}), 400
 
 
+@app.route('/api/dev/test-notification', methods=['POST'])
+def dev_test_notification():
+    """Development-only endpoint for direct real-device FCM testing."""
+    try:
+        req_data = request.get_json() or {}
+        device_token = req_data.get('deviceToken')
+        if not device_token:
+            return jsonify({'error': 'deviceToken is required'}), 400
+
+        notif_type = req_data.get('notificationType', 'TEST_NOTIFICATION')
+        title = req_data.get('title', '⚡ PowrSply Real Device Test')
+        body = req_data.get('body', 'FCM background delivery test on real device.')
+        channel_id = req_data.get('channelId', 'powrsply_general_v1')
+        sound = req_data.get('sound', 'powrsply_notification')
+
+        data = {
+            'type': notif_type,
+            'title': title,
+            'body': body,
+            'channelId': channel_id,
+            'sound': sound,
+            'timestamp': str(int(time.time()))
+        }
+
+        from src.infrastructure.firebase.fcm_service import FCMService
+        message_id = FCMService.send_to_token(
+            token=device_token,
+            data=data,
+            title=title,
+            body=body,
+            channel_id=channel_id,
+            sound=sound
+        )
+
+        return jsonify({
+            'status': 'success',
+            'messageId': message_id,
+            'targetToken': device_token[:15] + '...',
+            'channelId': channel_id,
+            'sound': sound
+        }), 200
+
+    except Exception as e:
+        print(f"[DEV TEST NOTIFICATION ERROR] {e}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
 @app.route('/api/health', methods=['GET'])
 @app.route('/health', methods=['GET'])
 def health_check():

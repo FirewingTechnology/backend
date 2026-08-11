@@ -81,20 +81,40 @@ class MatchingEngine:
         # that the frontend uses to display immediately or delay.
         
         payload = {
-            "type": "NEW_JOB",
+            "type": "NEW_JOB_REQUEST",
             "jobId": job_id,
             "amountPaise": str(job_data.get('amountPaise', 0)),
             "category": job_data.get('category', 'general')
         }
         
         for pro_uid in batch_1:
-            # We assume token resolution happens here
-            FCMService.send_to_topic(topic=f"pro_direct_{pro_uid}", data=payload, title="Priority Job!", body="You have priority access to a nearby job.")
+            FCMService.send_to_topic(
+                topic=f"pro_{pro_uid}",
+                data=payload,
+                title="⚡ Priority Job Dispatch!",
+                body="You have priority access to a nearby electrical job.",
+                channel_id="powrsply_job_requests_v1",
+                sound="job_request_ring"
+            )
             
         for pro_uid in batch_2:
-            FCMService.send_to_topic(topic=f"pro_direct_{pro_uid}", data=payload, title="New Job", body="A job is available.")
+            FCMService.send_to_topic(
+                topic=f"pro_{pro_uid}",
+                data=payload,
+                title="⚡ New Job Available!",
+                body="An electrical job is available near your location.",
+                channel_id="powrsply_job_requests_v1",
+                sound="job_request_ring"
+            )
             
         for pro_uid in batch_3:
-            FCMService.send_to_topic(topic=f"pro_direct_{pro_uid}", data=payload, title="New Job", body="A job is available.")
+            FCMService.send_to_topic(
+                topic=f"pro_{pro_uid}",
+                data=payload,
+                title="⚡ New Job Available!",
+                body="An electrical job is available near your location.",
+                channel_id="powrsply_job_requests_v1",
+                sound="job_request_ring"
+            )
             
         return len(batch_1) + len(batch_2) + len(batch_3)

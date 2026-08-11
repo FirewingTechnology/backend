@@ -154,6 +154,17 @@ class ChatService:
                     "roomId": room_id,
                     "messageId": message_id
                 },
+                android=messaging.AndroidConfig(
+                    notification=messaging.AndroidNotification(
+                        channel_id="powrsply_v3_channel",
+                        sound="powrsply_notification",
+                    )
+                ),
+                apns=messaging.APNSConfig(
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(sound="powrsply_notification.mp3")
+                    )
+                ),
                 token=fcm_token
             )
             response = messaging.send(msg)

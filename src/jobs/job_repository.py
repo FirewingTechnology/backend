@@ -4,7 +4,7 @@ from typing import Dict, Any
 class JobRepository:
     def __init__(self):
         self.db = firestore.client()
-        self.collection = self.db.collection('jobs')
+        self.collection = self.db.collection('job_requests')
 
     def create_job(self, job_data: Dict[str, Any]) -> str:
         # Create a new document with an auto-generated ID
