@@ -6,20 +6,67 @@ class FraudDetector:
     def __init__(self, security_service: SecurityEventService):
         self.security_service = security_service
 
-    def detect_self_booking(self, user_uid: str, pro_uid: str, job_id: str):
-        """Immediately flag if a Pro attempts to book themselves."""
-        if user_uid == pro_uid:
-            self.security_service.log_event(
-                event_type="FRAUD_SELF_BOOKING",
-                severity="CRITICAL",
-                source_ip="backend_detector",
-                details={
-                    "jobId": job_id,
-                    "proUid": pro_uid,
-                    "reason": "Pro attempted to accept their own job request."
+    def detect_self_booking(self, user_uid: str, pro_uid: str, job_id: str, user_phone: str = "", pro_phone: str = "") -> bool:
+        """Immediately flag and block Pro for 1 hour if a Pro attempts self-booking."""
+        is_self = False
+        if user_uid and pro_uid and user_uid == pro_uid:
+            is_self = True
+        elif user_phone and pro_phone and user_phone == pro_phone:
+            is_self = True
+
+        if is_self:
+            from datetime import datetime, timedelta
+            from firebase_admin import firestore
+            
+            suspended_until = datetime.utcnow() + timedelta(hours=1)
+            reason = "Suspicious Activity: Self-booking attempt detected. Account blocked for 1 hour."
+            
+            # 1. Log critical security event
+            try:
+                self.security_service.log_event(
+                    event_type="FRAUD_SELF_BOOKING",
+                    severity="CRITICAL",
+                    source_ip="backend_detector",
+                    details={
+                        "jobId": job_id,
+                        "proUid": pro_uid,
+                        "userUid": user_uid,
+                        "reason": reason,
+                        "suspendedUntil": suspended_until.isoformat()
+                    }
+                )
+            except Exception as e:
+                print(f"[SECURITY_LOG_ERROR] {e}")
+
+            # 2. Block Pro account in Firestore for 1 hour
+            try:
+                db = firestore.client()
+                target_uid = pro_uid or user_uid
+                update_payload = {
+                    'accountStatus': 'suspended',
+                    'verificationStatus': 'suspended',
+                    'suspendedUntil': suspended_until,
+                    'blockReason': reason,
+                    'isOnline': False,
+                    'isAvailable': False,
+                    'flaggedCount': firestore.Increment(1),
+                    'updatedAt': firestore.SERVER_TIMESTAMP
                 }
-            )
-            # In a real system, you might immediately suspend the account here.
+                db.collection('users').document(target_uid).set(update_payload, merge=True)
+                db.collection('electricians').document(target_uid).set(update_payload, merge=True)
+                
+                # Write to admin audit logs
+                db.collection('admin_logs').add({
+                    'adminEmail': 'SYSTEM_FRAUD_DETECTOR',
+                    'action': 'FRAUD_SELF_BOOKING_BLOCKED',
+                    'details': f'Pro {target_uid} attempted self-booking for job {job_id}. Pro account blocked for 1 hour.',
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+            except Exception as e:
+                print(f"[ACCOUNT_SUSPENSION_ERROR] {e}")
+
+            return True
+        return False
 
     def detect_location_spoofing(self, pro_uid: str, old_location: Dict[str, float], new_location: Dict[str, float], time_delta_seconds: int):
         """

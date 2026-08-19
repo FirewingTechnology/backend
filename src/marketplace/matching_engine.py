@@ -51,10 +51,16 @@ class MatchingEngine:
         batch_2 = [] # Silver < 2km
         batch_3 = [] # Bronze < 5km
         
+        user_uid = job_data.get('userId') or job_data.get('userUid') or ""
+
         for pro in nearby_pros:
             pro_uid = pro[0].decode('utf-8')
             distance = pro[1]
             
+            # Anti-fraud: Never dispatch a job to the user who requested it
+            if user_uid and pro_uid == user_uid:
+                continue
+
             # Check if online (last seen < 5 mins ago)
             last_seen_bytes = self.redis.hget("pros_last_seen", pro_uid)
             if not last_seen_bytes:

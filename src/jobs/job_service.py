@@ -4,8 +4,11 @@ from src.infrastructure.firebase.fcm_service import FCMService
 from src.infrastructure.redis.lock_service import RedisLockService
 from src.infrastructure.redis.exceptions import LockAcquisitionError
 from src.marketplace.matching_engine import MatchingEngine
+from src.marketplace.fraud_detector import FraudDetector
+from src.core.security.event_service import SecurityEventService
+from src.core.security.event_repository import SecurityEventRepository
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 class JobService:
     def __init__(self):
@@ -20,9 +23,20 @@ class JobService:
         
         self.lock_service = RedisLockService(redis_client)
         self.matching_engine = MatchingEngine(redis_client)
+        self.security_service = SecurityEventService(SecurityEventRepository(self.db))
+        self.fraud_detector = FraudDetector(self.security_service)
 
     def dispatch_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
         """Saves job and broadcasts to nearby pros via FCM topic based on geohash prefix."""
+        user_uid = job_data.get('userId') or job_data.get('userUid')
+        pro_uid = job_data.get('electricianId') or job_data.get('proUid')
+        user_phone = job_data.get('phone') or job_data.get('userPhone') or ""
+
+        # Check self booking on direct dispatch
+        if pro_uid and user_uid:
+            if self.fraud_detector.detect_self_booking(user_uid, pro_uid, job_data.get('idempotencyKey', 'direct_dispatch'), user_phone=user_phone):
+                raise ValueError("Suspicious Activity: You cannot book yourself. Your pro account has been suspended for 1 hour.")
+
         idem_key = job_data.get('idempotencyKey')
         
         # 1. Fast Cache Idempotency Check
@@ -60,18 +74,32 @@ class JobService:
         try:
             with self.lock_service.acquire(lock_key, expire_seconds=5):
                 job = self.repo.get_job(job_id)
-                if job.get('status') != 'searching':
+                if not job:
+                    raise ValueError("Job not found")
+                if job.get('status') != 'searching' and job.get('status') != 'pending':
                     raise ValueError("Job is no longer available")
-                
+
+                user_uid = job.get('userUid') or job.get('userId')
+                user_phone = job.get('phone') or job.get('userPhone') or ""
+
+                # 1. Anti-fraud check: Prevent Pro from accepting their own booking
+                if user_uid == pro_uid or (user_phone and self._get_pro_phone(pro_uid) == user_phone):
+                    self.fraud_detector.detect_self_booking(user_uid, pro_uid, job_id, user_phone=user_phone, pro_phone=self._get_pro_phone(pro_uid))
+                    raise ValueError("Suspicious Activity: You cannot accept your own booking. Your pro account has been suspended for 1 hour.")
+
+                # 2. Check if Pro is currently suspended
+                if self._is_pro_suspended(pro_uid):
+                    raise ValueError("Unauthorized: Your Pro account is temporarily suspended.")
+
                 updates = {
                     'status': 'accepted',
                     'proUid': pro_uid,
+                    'electricianId': pro_uid,
                     'acceptedAt': firestore.SERVER_TIMESTAMP
                 }
                 self.repo.update_job(job_id, updates)
                 
                 # Notify User that Pro accepted
-                user_uid = job.get('userUid')
                 if user_uid:
                     FCMService.send_to_topic(
                         topic=f"user_{user_uid}",
@@ -83,6 +111,34 @@ class JobService:
                 return updates
         except LockAcquisitionError:
             raise ValueError("Another Pro is currently accepting this job")
+
+    def _get_pro_phone(self, pro_uid: str) -> str:
+        try:
+            user_doc = self.db.collection('users').document(pro_uid).get()
+            if user_doc.exists:
+                data = user_doc.to_dict() or {}
+                return data.get('phone') or data.get('phoneNumber') or ""
+        except Exception:
+            pass
+        return ""
+
+    def _is_pro_suspended(self, pro_uid: str) -> bool:
+        try:
+            user_doc = self.db.collection('users').document(pro_uid).get()
+            if user_doc.exists:
+                data = user_doc.to_dict() or {}
+                if data.get('accountStatus') == 'suspended' or data.get('verificationStatus') == 'suspended':
+                    suspended_until = data.get('suspendedUntil')
+                    if suspended_until:
+                        # Check if suspendedUntil is in future
+                        if isinstance(suspended_until, datetime):
+                            if suspended_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+                                return True
+                        return True
+                    return True
+        except Exception:
+            pass
+        return False
 
     def transition_job(self, job_id: str, pro_uid: str, new_state: str) -> Dict[str, Any]:
         """Progresses job through strict linear states and notifies customer."""
