@@ -1,15 +1,17 @@
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from redis import Redis
 from src.infrastructure.firebase.fcm_service import FCMService
+from src.marketplace.presence_service import PresenceService
 
 class MatchingEngine:
     """
     Handles massive-scale geographic matching using Redis GEO commands 
-    instead of Firestore queries to prevent index hotspots at 100k+ scale.
+    and Server-Authoritative presence validation.
     """
-    def __init__(self, redis_client: Redis):
+    def __init__(self, redis_client: Redis, presence_service: Optional[PresenceService] = None):
         self.redis = redis_client
+        self.presence_service = presence_service
 
     def update_pro_location(self, pro_uid: str, lat: float, lng: float, tier: str):
         """
@@ -35,9 +37,26 @@ class MatchingEngine:
                 self.redis.hdel("pros_tiers", pro_uid)
                 self.redis.hdel("pros_last_seen", pro_uid)
 
+    def _filter_active_candidates(self, candidate_list: List[str]) -> List[str]:
+        """
+        Performs final atomic server-authoritative presence verification 
+        immediately before dispatching a job, eliminating race conditions.
+        """
+        if not self.presence_service:
+            return candidate_list
+
+        active_list = []
+        for pro_uid in candidate_list:
+            is_active, reason = self.presence_service.validate_active_presence(pro_uid)
+            if not is_active:
+                print(f"[MatchingEngine] PRE_DISPATCH_FILTERED: Dropping Pro {pro_uid[:6]}*** before dispatch. Reason: {reason}")
+                continue
+            active_list.append(pro_uid)
+        return active_list
+
     def dispatch_job(self, job_id: str, lat: float, lng: float, job_data: Dict[str, Any]):
         """
-        Performs the Weighted Batch Dispatch algorithm.
+        Performs the Weighted Batch Dispatch algorithm with atomic pre-dispatch presence validation.
         Batch 1: Platinum & Gold (1km)
         Batch 2: Silver (2km) 
         Batch 3: Bronze (5km)
@@ -61,11 +80,15 @@ class MatchingEngine:
             if user_uid and pro_uid == user_uid:
                 continue
 
-            # Check if online (last seen < 5 mins ago)
+            # Check if online (server-authoritative lease: last seen <= 90 seconds ago)
             last_seen_bytes = self.redis.hget("pros_last_seen", pro_uid)
             if not last_seen_bytes:
+                print(f"[MatchingEngine] STALE_PRO_FILTERED: Pro {pro_uid[:6]}*** has no last_seen record. Skipping dispatch.")
                 continue
-            if current_time - int(last_seen_bytes.decode('utf-8')) > 300:
+                
+            last_seen_sec = int(last_seen_bytes.decode('utf-8'))
+            if current_time - last_seen_sec > 90:
+                print(f"[MatchingEngine] STALE_PRO_FILTERED: Pro {pro_uid[:6]}*** last heartbeat was {current_time - last_seen_sec}s ago (>90s). Skipping dispatch.")
                 continue
                 
             tier_bytes = self.redis.hget("pros_tiers", pro_uid)
@@ -78,14 +101,11 @@ class MatchingEngine:
             elif distance <= 5.0:
                 batch_3.append(pro_uid)
                 
-        # In a real async system (like Celery), you would:
-        # 1. Fire Batch 1
-        # 2. Sleep 15s. Check if job accepted. If not, fire Batch 2.
-        # 3. Sleep 15s. Check if job accepted. If not, fire Batch 3.
-        
-        # For the architecture demo, we will fire all batches with an attribute
-        # that the frontend uses to display immediately or delay.
-        
+        # 2. FINAL ATOMIC PRE-DISPATCH CHECK
+        batch_1 = self._filter_active_candidates(batch_1)
+        batch_2 = self._filter_active_candidates(batch_2)
+        batch_3 = self._filter_active_candidates(batch_3)
+
         payload = {
             "type": "NEW_JOB_REQUEST",
             "jobId": job_id,

@@ -142,6 +142,31 @@ try:
     app.register_blueprint(chat_api, url_prefix='/api/chat')
     app.register_blueprint(auth_api, url_prefix='/api/auth')
     app.register_blueprint(voice_api, url_prefix='/api')
+    # Presence & Matching Imports
+    from src.marketplace.presence_service import PresenceService
+    from src.marketplace.matching_engine import MatchingEngine
+    from src.marketplace.presence_controller import presence_api
+
+    presence_service = PresenceService(db, redis_client)
+    matching_engine = MatchingEngine(redis_client, presence_service)
+    app.config['PRESENCE_SERVICE'] = presence_service
+    app.config['MATCHING_ENGINE'] = matching_engine
+
+    app.register_blueprint(presence_api)
+
+    # Start periodic background reconciliation worker (runs every 30s)
+    import threading
+    def _run_periodic_presence_reconciliation():
+        import time
+        while True:
+            try:
+                time.sleep(30)
+                presence_service.reconcile_expired_presence()
+            except Exception as pe:
+                print(f"[PresenceBackgroundWorker] Reconciliation error: {pe}")
+    
+    reconciliation_thread = threading.Thread(target=_run_periodic_presence_reconciliation, daemon=True)
+    reconciliation_thread.start()
 
 except Exception as e:
     print(f"Failed to initialize V2 Finance modules: {e}")
